@@ -1,0 +1,105 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: library-seat-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-library_seat_dev}
+      MYSQL_DATABASE: ${DB_DATABASE:-library_seat}
+    # 不发布宿主机端口：后端经 Docker 内网 mysql:3306 访问，避免与共享服务器上其他服务冲突
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: library-seat-redis
+    restart: unless-stopped
+    # 不发布宿主机端口：后端经 Docker 内网 redis:6379 访问
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: .
+    container_name: library-seat-backend
+    restart: unless-stopped
+    # .env 由 scripts/init-env.ps1（Windows）/ scripts/init-env.sh（macOS/Linux）生成
+    # 文件缺失时 compose 会直接报错，避免密钥不明来源地"默认值"启动
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_USERNAME: root
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    # sso.hdu.edu.cn 为分域 DNS：校园网内解析为内网地址(192.168.101.252)，公网解析为 218.75.123.164。
+    # 容器内解析结果与宿主机不一致（可能拿到 IPv6 或内网地址，两者在容器网络中均不可达），
+    # 导致 CAS 登录 10s 连接超时；此处钉住已验证可达的公网 IP。
+    # 学校若更换 IP（查法：nslookup sso.hdu.edu.cn 223.5.5.5），需同步更新此处。
+    extra_hosts:
+      - "sso.hdu.edu.cn:218.75.123.164"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # GET / 为后端根路由，连接成功即视为存活
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/').then(()=>process.exit(0)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 40s
+
+  frontend:
+    build: ./frontend
+    container_name: library-seat-frontend
+    restart: unless-stopped
+    # 不发布宿主机端口：对外入口统一收口到 caddy，避免绕过 Basic Auth 直连 nginx/后端
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # 对外唯一入口：Basic Auth 鉴权后转发 frontend 容器
+  caddy:
+    image: caddy:2-alpine
+    container_name: library-seat-caddy
+    restart: unless-stopped
+    # 对外端口必须显式配置（.env 的 FRONTEND_PORT）：共享服务器上无法保证任何默认端口可用，
+    # 漏配时直接报错终止，而不是启动后才暴露端口冲突
+    ports:
+      - "${FRONTEND_PORT:?FRONTEND_PORT 未设置，请在 .env 中配置}:80"
+    # 不注入任何环境变量：Basic Auth 凭据经 ./auth.caddy 文件只读挂载（见下方 volumes）。
+    # 原因：compose 对 environment 与 env_file 的值都会做 $ 变量插值，
+    # bcrypt 哈希形如 $2a$14$xxx，其中 $xxx 段会被当未定义变量静默置空，
+    # 实测容器只能收到 $2a$14（残缺哈希），Basic Auth 静默失效。
+    # auth.caddy 由 Caddyfile import 原样读取，全程不经插值。
+    # auth.caddy 缺失或哈希为占位符时 caddy 启动即失败（fail-fast），不会无鉴权暴露
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Basic Auth 凭据（用户名 + 完整 bcrypt 哈希，生成方式见 auth.caddy.example）
+      - ./auth.caddy:/etc/caddy/auth.caddy:ro
+      # 证书持久化：将来配域名启用 HTTPS 时必须保留，否则容器重建会丢失已签发证书
+      # （Let's Encrypt 有速率限制，频繁重新签发会被临时封禁）
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - frontend
+
+volumes:
+  mysql-data:
+  redis-data:
+  caddy-data:
+  caddy-config:
