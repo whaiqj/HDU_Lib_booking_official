@@ -1,0 +1,147 @@
+diff --git a/src/modules/grab-seat/grab-seat-worker.service.ts b/src/modules/grab-seat/grab-seat-worker.service.ts
+index 3d87b52..7427fdd 100644
+--- a/src/modules/grab-seat/grab-seat-worker.service.ts
++++ b/src/modules/grab-seat/grab-seat-worker.service.ts
+@@ -410,7 +410,7 @@ export class GrabSeatWorker {
+    * - SEAT_TAKEN      → 不弃座不终止：轮转候选（单座位即重试本座），常规频率打到窗口结束
+    *                     （被占可能是瞬态假象，且他人取消会释放座位）
+    * - SESSION_EXPIRED → 刷新会话后重试
+-   * - NETWORK/超时     → 先 search 确认座位真实状态（book 可能已被受理）再决定重试或换座
++   * - NETWORK/超时     → 原 800ms 网络退避后重试；不在热路径同步查询，结果未知保留诊断
+    * - 未知错误        → 不终止：累计 2 次后降级低频（3s），由 3 分钟窗口兜底
+    * @param firstFireMs 首击时刻（anchor + blindStartOffsetMs）：真实放号在 triggerAt 后约 5s，
+    *                    之前的尝试只会白烧限流配额，循环开始前先等到该时刻
+@@ -588,6 +588,10 @@ export class GrabSeatWorker {
+       );
+ 
+       const errorCategory = this.mapBookErrorToCategory(bookResult.errorCode);
++      // 只有连续无响应才累计网络错误；业务响应证明服务端仍在响应。
++      if (errorCategory !== ErrorCategory.NETWORK) {
++        consecutiveNetworkErrors = 0;
++      }
+       this.logger.log(
+         `[盲抢第 ${attempt} 次尝试结果] taskId=${task.id} seat=${seat.title}(${seat.seatId}) ` +
+           `errorCategory=${errorCategory} errorMessage=${bookResult.errorMessage ?? '-'}`,
+@@ -663,31 +667,27 @@ export class GrabSeatWorker {
+ 
+       if (errorCategory === ErrorCategory.NETWORK) {
+         consecutiveNetworkErrors++;
+-        // book 超时 ≠ 失败：服务端可能已受理。先 search 确认座位真实状态，
+-        // 仍空闲(state=0) → 肯定没约上，重试；非空闲 → 可能是自己的预约生效，也可能是被抢 → 换座
+-        const confirmed = await this.confirmSeatState(
+-          task,
+-          preparsed.roomId,
+-          seat,
+-        );
+-        if (confirmed === 'available') {
+-          if (consecutiveNetworkErrors >= RETRY_CONFIG.blindMaxConsecutiveNetworkErrors) {
+-            await this.markFailed(task, '连续网络异常，盲抢终止', attempt, startMs);
+-            return;
+-          }
+-          await this.sleepInterruptible(
+-            Math.min(this.jitterMs(RETRY_CONFIG.blindNetworkBackoffMs), deadline - Date.now()),
+-            task.id,
+-          );
+-          continue; // 重试同座位
++        // 响应超时不证明未受理；保留未知结果，但不再同步 search 阻塞重试。
++        task.result = { ...(task.result ?? {}), reservationOutcomeUnknown: true };
++        this.logger.warn(JSON.stringify({
++          event: 'reservation_outcome_unknown',
++          taskId: task.id,
++          seatId: seat.seatId,
++          attempt,
++          ts: Date.now(),
++        }));
++        if (consecutiveNetworkErrors >= RETRY_CONFIG.blindMaxConsecutiveNetworkErrors) {
++          await this.markFailed(task, '连续网络异常，预约结果未知，需核实', attempt, startMs);
++          return;
+         }
+-        // 状态未知或非空闲：按被占处理 —— 同样不弃座不终止，轮转继续打到窗口结束
+-        queue.push(queue.shift()!);
+-        await this.sleepInterruptible(
+-          Math.min(this.jitterMs(RETRY_CONFIG.blindWindowNotOpenIntervalMs), deadline - Date.now()),
++        if (await this.sleepInterruptible(
++          Math.min(this.jitterMs(RETRY_CONFIG.blindNetworkBackoffMs), deadline - Date.now()),
+           task.id,
+-        );
+-        continue;
++        )) {
++          this.logTaskFinished(task.id, 'cancelled', null, attempt, startMs);
++          return;
++        }
++        continue; // 原网络退避 800ms 后重试本座；不新增并发或查询。
+       }
+ 
+       // 不可重试错误（黑名单/参数错误等）
+@@ -831,48 +831,6 @@ export class GrabSeatWorker {
+     return handle;
+   }
+ 
+-  /**
+-   * book 网络超时后的座位状态确认：search 该房间一次，返回目标座位当前状态
+-   * @returns 'available' 空闲可约 / 'taken' 非空闲 / 'unknown' 查询失败
+-   */
+-  private async confirmSeatState(
+-    task: GrabTask,
+-    roomId: string,
+-    seat: PreparsedSeat,
+-  ): Promise<'available' | 'taken' | 'unknown'> {
+-    try {
+-      const searchResult = await this.hduLibraryClient.searchSeats(
+-        {
+-          beginTime: Number(task.beginTime),
+-          duration: task.duration,
+-          num: 1,
+-          space_category: {
+-            category_id: task.categoryId,
+-            content_id: task.contentId,
+-          },
+-        },
+-        task.accountId,
+-        task.id,
+-      );
+-      // 优先在房间目录里找目标房间（search 推荐房间会轮换），退化为 seats 主列表
+-      const room =
+-        searchResult.allRooms?.find((r) => r.id === roomId) ??
+-        (searchResult.room.id === roomId
+-          ? { id: searchResult.room.id, name: searchResult.room.name, seats: searchResult.seats }
+-          : null);
+-      if (!room) {
+-        return 'unknown';
+-      }
+-      const found = room.seats.find((s) => s.id === seat.seatId);
+-      return found && found.state === 0 ? 'available' : 'taken';
+-    } catch (e) {
+-      this.logger.warn(
+-        `[确认座位状态失败] taskId=${task.id} seat=${seat.seatId} message=${(e as Error).message}`,
+-      );
+-      return 'unknown';
+-    }
+-  }
+-
+   /**
+    * 单次抢座尝试：包含 searchSeats + bookSeats 全流程
+    * @param notifiedTakenSeats 已提醒过的被占座位集合（跨尝试去重）
+@@ -978,7 +936,7 @@ export class GrabSeatWorker {
+       return { ...result, timing };
+     }
+ 
+-    // 任务指定 roomId 时锁定目标房间座位表（与盲抢预解析/confirmSeatState 一致）：
++    // 任务指定 roomId 时锁定目标房间座位表（与盲抢预解析一致）：
+     // search 推荐房间在多房间分类下会轮换，直接用推荐房间会查错房间
+     // （同名座位号在别的房间被占，会被误报占座并分配到别的房间的座位）
+     let roomSeats = searchResult.seats;
+@@ -1239,7 +1197,12 @@ export class GrabSeatWorker {
+     // V4 防覆盖：终态合并写而非整体替换，保留运行期写入的 preparse / takenSeats 诊断现场
+     const failureCategory = this.classifyFailureReason(reason);
+     const existingResult = (await this.grabTaskService.findById(task.id))?.result ?? task.result ?? {};
+-    const mergedResult = { ...existingResult, reason, failureCategory };
++    const mergedResult = {
++      ...existingResult,
++      ...(task.result?.reservationOutcomeUnknown ? { reservationOutcomeUnknown: true } : {}),
++      reason,
++      failureCategory,
++    };
+     await this.grabTaskService.updateStatus(task.id, TaskStatus.FAILED, mergedResult);
+     await this.notification.notify({
+       userId: task.accountId,

@@ -64,6 +64,8 @@ export function classifyError(
  * 可重试的错误分类集合
  * UNKNOWN 也纳入可重试：由重试循环降级为保守低频节奏（见 RETRY_CONFIG.unknownDegradeThreshold），
  * 不作为终止条件 —— 未知文案误杀任务的代价高于低频多试
+ * ALREADY_BOOKED 纳入可重试：文案本身不能证明本任务成功，只有学校预约详情
+ * 精确匹配后才收尾；未匹配时继续尝试（9/16 用户裁决）。
  */
 export const RETRYABLE: Set<ErrorCategory> = new Set([
   ErrorCategory.NETWORK,
@@ -71,6 +73,7 @@ export const RETRYABLE: Set<ErrorCategory> = new Set([
   ErrorCategory.SEAT_UNAVAILABLE,
   ErrorCategory.SESSION_EXPIRED,
   ErrorCategory.WINDOW_NOT_OPEN,
+  ErrorCategory.ALREADY_BOOKED,
   ErrorCategory.UNKNOWN, // 有限次数的保守重试
 ]);
 

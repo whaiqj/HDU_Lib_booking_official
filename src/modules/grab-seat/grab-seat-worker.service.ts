@@ -17,6 +17,7 @@ import { buildTaskMeta } from '../notification/notification-templates';
 import { BookErrorCode } from '../hdu-library/errors/book-error-code.enum';
 import { ErrorCategory } from '../hdu-library/errors/error-category.enum';
 import { isRetryable } from '../hdu-library/errors/error-classifier';
+import type { BookingMatchQuery, VerifiedBooking } from '../hdu-library/dto/verified-booking.dto';
 
 /**
  * 抢座重试配置（两段式节奏 + WINDOW_NOT_OPEN 快速通道）
@@ -58,16 +59,18 @@ export const RETRY_CONFIG = {
   blindWindowNotOpenIntervalMs: 1_150,
   /** 限流后退避：计数大概率刚清零，等满频控窗口再发 */
   blindRateLimitBackoffMs: 1_400,
-  /** book 网络超时后的确认搜索退避 */
+  /** book 网络超时后的重试退避（不再 search 确认，直接重打同座位） */
   blindNetworkBackoffMs: 800,
-  /** 连续网络错误上限：超过后任务失败（避免盲打无响应的服务端） */
+  /**
+   * 连续"无响应超时"上限：超过后任务失败（避免盲打彻底无响应的服务端）。
+   * 收到任何服务端响应（含业务错误）即清零 —— 有响应即证明服务端活着
+   */
   blindMaxConsecutiveNetworkErrors: 5,
   /**
-   * 盲抢起始偏移：两晚实测（8/22、8/23）放号窗口在 triggerAt 后约 5s 才真正开放，
-   * 之前的请求只会白烧限流配额（8/23 三账号 T=0 齐发，第二轮起全部被限流），
-   * 首击直接对齐 anchor + 5s，不做无效尝试
+   * 10/13 的 +3 秒单次预约成功后，首发采用 +3 秒基础偏移。
+   * 多账号按配置列表每位固定错开 100ms，首发不再随机上浮。
    */
-  blindStartOffsetMs: 5_000,
+  blindStartOffsetMs: 3_000,
   /**
    * 盲抢间隔随机上浮幅度（0 ~ 2×spread）：多账号并发时打破齐步节奏，
    * 避免同退避后同瞬间重发、互相触发 IP 级限流（8/23 三任务齐步走全灭）。
@@ -145,12 +148,26 @@ export class GrabSeatWorker {
    *                 绝不用下游时间点冒充唤醒时刻。
    */
   async executeGrab(task: GrabTask, wakeupMs?: number): Promise<void> {
+    const executionStartedMs = Date.now();
     try {
       await this.runGrabTask(task, wakeupMs);
+    } catch (error) {
+      const safeCode = (value: unknown) => String(value ?? '')
+        .replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64) || null;
+      this.logger.error(JSON.stringify({
+        event: 'task_execution_error', taskId: task.id, accountId: task.accountId,
+        errorName: safeCode((error as Error)?.name),
+        errorCode: safeCode((error as NodeJS.ErrnoException)?.code), ts: Date.now(),
+      }));
+      throw error;
     } finally {
       // 任务执行生命周期结束（成功/失败/运行中取消/异常退出）统一清理预解析缓存，
       // 防止终态后条目常驻进程内存（RAM 缓存泄漏）
       this.seatPreparse.invalidate(task.id);
+      this.logger.log(JSON.stringify({
+        event: 'task_execution_closed', taskId: task.id, accountId: task.accountId,
+        durationMs: Date.now() - executionStartedMs, ts: Date.now(),
+      }));
     }
   }
 
@@ -196,13 +213,37 @@ export class GrabSeatWorker {
     // bookSeats 直发不再经过 searchSeats —— search 快照在开闸瞬间不可信（实测会闪断/轮换房间），
     // 且拥塞时 8s 超时会把整条抢座链路卡死；bookSeats 才是唯一裁判
     const preparsed = await this.resolvePreparse(task);
+    this.logger.log(JSON.stringify({
+      event: 'preparse_ready', taskId: task.id, accountId: task.accountId,
+      ready: Boolean(preparsed), roomId: preparsed?.roomId ?? task.roomId ?? null,
+      seats: preparsed?.seats ?? [], unresolvedTitles: preparsed?.unresolvedTitles ?? [],
+      userInfoPresent: Boolean(preparsed?.userInfoId), triggerAtMs, deadlineMs: deadline,
+      beginTime: Number(task.beginTime), duration: task.duration,
+      strictMode: task.strictMode, seatPreference: task.seatPreference ?? [], ts: Date.now(),
+    }));
     if (preparsed) {
+      const configuredFirstFireAccounts = (process.env.GRAB_FIRST_FIRE_ACCOUNT_IDS ?? '')
+        .split(',')
+        .map((id) => id.trim())
+        .filter(Boolean);
+      const accountIndex = configuredFirstFireAccounts.indexOf(task.accountId);
+      const blindOffsetMs = RETRY_CONFIG.blindStartOffsetMs + Math.max(0, accountIndex) * 100;
+      this.logger.log(JSON.stringify({
+        event: 'first_fire_plan',
+        taskId: task.id,
+        accountId: task.accountId,
+        triggerAtMs,
+        wakeupMs: wakeupMs ?? null,
+        preparseReadyMs: Date.now(),
+        offsetMs: blindOffsetMs,
+        earliestFireMs: anchor + blindOffsetMs,
+      }));
       await this.executeBlindGrab(
         task,
         preparsed,
         deadline,
         startMs,
-        anchor + RETRY_CONFIG.blindStartOffsetMs,
+        anchor + blindOffsetMs,
       );
       return;
     }
@@ -214,6 +255,33 @@ export class GrabSeatWorker {
     const notifiedTakenSeats = new Set<string>();
     // 最后一次"座位不可用"的具体原因，最终失败时透出给用户
     let lastSeatError: string | undefined;
+    const attemptedSeats = new Map<string, string>();
+    let sawAlreadyBooked = false;
+    const finishFallback = async (reason: string): Promise<void> => {
+      if (task.roomId && attemptedSeats.size > 0 &&
+          (task.result?.reservationOutcomeUnknown || sawAlreadyBooked)) {
+        try {
+          const booking = await this.hduLibraryClient.findMatchingBooking(task.accountId, {
+            roomId: task.roomId,
+            beginTime: Number(task.beginTime),
+            duration: task.duration,
+            seats: [...attemptedSeats].map(([seatId, title]) => ({ seatId, title })),
+          });
+          if (booking) {
+            await this.markSuccess(task, {
+              success: true, bookedSeatId: booking.seatId, seatTitle: booking.seatTitle,
+            }, attempt, startMs, booking);
+            return;
+          }
+        } catch (error) {
+          this.logger.warn(JSON.stringify({
+            event: 'booking_verification_error', taskId: task.id,
+            errorName: (error as Error).name, ts: Date.now(),
+          }));
+        }
+      }
+      await this.markFailed(task, reason, attempt, startMs);
+    };
 
     while (Date.now() < deadline) {
       // 用户在抢座过程中手动终止任务 → 立即退出，不标记失败、不发失败通知
@@ -243,7 +311,7 @@ export class GrabSeatWorker {
       );
       this.logger.log(`[第 ${attempt} 次尝试开始] taskId=${task.id}`);
 
-      const result = await this.tryGrabOnce(task, notifiedTakenSeats, attempt);
+      const result = await this.tryGrabOnce(task, notifiedTakenSeats, attempt, attemptedSeats);
       this.logger.log(
         `[第 ${attempt} 次尝试结果] taskId=${task.id} success=${result.success} ` +
           `errorCategory=${result.errorCategory ?? '-'} errorMessage=${result.errorMessage ?? '-'}`,
@@ -284,17 +352,41 @@ export class GrabSeatWorker {
         return;
       }
 
+      if (result.errorCategory === ErrorCategory.NETWORK && result.timing.books.length > 0) {
+        task.result = { ...(task.result ?? {}), reservationOutcomeUnknown: true };
+      }
+      if (result.errorCategory === ErrorCategory.ALREADY_BOOKED) {
+        sawAlreadyBooked = true;
+        task.result = { ...(task.result ?? {}), reservationOutcomeUnknown: true };
+        // 精确匹配到本任务实际提交的预约才收尾；其它预约不算成功。
+        if (task.roomId && attemptedSeats.size > 0) {
+          try {
+            const booking = await this.hduLibraryClient.findMatchingBooking(task.accountId, {
+              roomId: task.roomId,
+              beginTime: Number(task.beginTime), duration: task.duration,
+              seats: [...attemptedSeats].map(([seatId, title]) => ({ seatId, title })),
+            });
+            if (booking) {
+              await this.markSuccess(task, {
+                success: true, bookedSeatId: booking.seatId, seatTitle: booking.seatTitle,
+              }, attempt, startMs, booking);
+              return;
+            }
+          } catch (error) {
+            this.logger.warn(JSON.stringify({
+              event: 'booking_verification_error', taskId: task.id,
+              errorName: (error as Error).name, ts: Date.now(),
+            }));
+          }
+        }
+      }
+
       // 登录态失效：尝试刷新会话后重试，刷新失败则终止
       if (result.errorCategory === ErrorCategory.SESSION_EXPIRED) {
         try {
           await this.authKeeper.refreshSession(task.accountId);
         } catch (e) {
-          await this.markFailed(
-            task,
-            `登录态刷新失败: ${(e as Error).message}`,
-            attempt,
-            startMs,
-          );
+          await finishFallback(`登录态刷新失败: ${(e as Error).message}`);
           return;
         }
         // 刷新成功，继续重试循环
@@ -302,7 +394,7 @@ export class GrabSeatWorker {
 
       // 不可重试错误（黑名单/参数错误等）直接终止
       if (result.errorCategory && !isRetryable(result.errorCategory)) {
-        await this.markFailed(task, result.errorMessage ?? '不可重试错误', attempt, startMs);
+        await finishFallback(result.errorMessage ?? '不可重试错误');
         return;
       }
 
@@ -339,6 +431,11 @@ export class GrabSeatWorker {
               ? RETRY_CONFIG.highFreqIntervalMs
               : RETRY_CONFIG.lowFreqIntervalMs;
       }
+      // 严格模式在预解析完全失败后可能走到本查座分支；此时也不能用
+      // WINDOW_NOT_OPEN 的 300ms 快速重试冲击第三方接口。
+      if (task.strictMode) {
+        nextInterval = Math.max(nextInterval, RETRY_CONFIG.blindWindowNotOpenIntervalMs);
+      }
       const sleepMs = Math.min(nextInterval, deadline - Date.now());
 
       // 等待期间轮询取消标记，被用户终止时立即退出
@@ -368,7 +465,7 @@ export class GrabSeatWorker {
     const reason = lastSeatError
       ? `${lastSeatError}（已尝试 ${attempt} 次后放弃）`
       : '超出时间窗口';
-    await this.markFailed(task, reason, attempt, startMs);
+    await finishFallback(reason);
   }
 
   /**
@@ -410,7 +507,9 @@ export class GrabSeatWorker {
    * - SEAT_TAKEN      → 不弃座不终止：轮转候选（单座位即重试本座），常规频率打到窗口结束
    *                     （被占可能是瞬态假象，且他人取消会释放座位）
    * - SESSION_EXPIRED → 刷新会话后重试
-   * - NETWORK/超时     → 先 search 确认座位真实状态（book 可能已被受理）再决定重试或换座
+   * - NETWORK/超时     → 短退避后重试同座位；连续纯超时达上限才终止（收到任何响应即清零）
+   * - 已有预约        → 异步查询学校预约详情；精确匹配本任务才记成功，
+   *                      否则轮转候选继续尝试（9/16 用户裁决）
    * - 未知错误        → 不终止：累计 2 次后降级低频（3s），由 3 分钟窗口兜底
    * @param firstFireMs 首击时刻（anchor + blindStartOffsetMs）：真实放号在 triggerAt 后约 5s，
    *                    之前的尝试只会白烧限流配额，循环开始前先等到该时刻
@@ -426,7 +525,7 @@ export class GrabSeatWorker {
       `[盲抢模式] taskId=${task.id} 房间=${preparsed.roomName}(${preparsed.roomId}) ` +
         `候选=${preparsed.seats.map((s) => `${s.title}(${s.seatId})`).join(' → ') || '(暂无，等待后台补解析)'} ` +
         `未解析=${preparsed.unresolvedTitles.join(',') || '-'} ` +
-        `userInfoId=${preparsed.userInfoId}`,
+        `userInfoId=available`,
     );
 
     // 候选队列：偏好顺序，被占用后轮转不出队
@@ -448,20 +547,15 @@ export class GrabSeatWorker {
         ? this.startSeatResolver(task, preparsed, unresolvedTitles, queue, deadline)
         : null;
 
-    // 起始偏移：唤醒早于首击时刻（正常：T-0 唤醒，等 5s）则等待；
+    // 起始偏移：唤醒早于计划首击时刻则等待；
     // 唤醒已晚于首击时刻（队列延迟）则立即开打。
-    // 等待时长钳制到偏移量本身，防御锚点异常（时钟回拨/测试 fake timers）导致超长等待。
-    // 首击也带随机上浮：多账号并发时首击不再是同一瞬间的齐射，
-    // 各任务错开落在 T+5s ~ T+5.4s 区间，避免互相触发 IP 级限流
-    const baseWaitMs = Math.min(
-      Math.max(0, firstFireMs - Date.now()),
-      RETRY_CONFIG.blindStartOffsetMs,
-    );
-    const initialWaitMs = baseWaitMs > 0 ? this.jitterMs(baseWaitMs) : 0;
+    // 固定错峰已经计入 firstFireMs，不再添加随机上浮或截断错峰。
+    const baseWaitMs = Math.max(0, firstFireMs - Date.now());
+    const initialWaitMs = baseWaitMs;
     if (initialWaitMs > 0) {
       this.logger.log(
         `[盲抢起始偏移] taskId=${task.id} ${Math.round(initialWaitMs)}ms 后首击` +
-          `（真实放号约在 triggerAt+${RETRY_CONFIG.blindStartOffsetMs / 1000}s）`,
+          `（计划首发时间 ${new Date(firstFireMs).toISOString()}）`,
       );
       if (await this.sleepInterruptible(initialWaitMs, task.id)) {
         resolver?.stop();
@@ -474,9 +568,62 @@ export class GrabSeatWorker {
     let unknownAttempts = 0;
     let consecutiveWindowNotOpen = 0;
     let consecutiveNetworkErrors = 0;
+    let verifiedBooking: VerifiedBooking | null = null;
+    let verificationPromise: Promise<void> | null = null;
+    let lastVerificationAt = 0;
+    let sawAlreadyBooked = false;
+    const attemptedSeats = new Map<string, string>();
+    const bookingQuery: BookingMatchQuery = {
+      roomId: preparsed.roomId,
+      beginTime: Number(task.beginTime),
+      duration: task.duration,
+      seats: [],
+    };
+    const verify = async (): Promise<void> => {
+      try {
+        // 只核对本任务真正提交过的座位，后台补解析的未尝试座位不算。
+        bookingQuery.seats = [...attemptedSeats].map(([seatId, title]) => ({ seatId, title }));
+        if (bookingQuery.seats.length === 0) return;
+        const booking = await this.hduLibraryClient.findMatchingBooking(task.accountId, bookingQuery);
+        if (booking) verifiedBooking = booking;
+        this.logger.log(JSON.stringify({
+          event: 'booking_verification', taskId: task.id,
+          matched: Boolean(booking), bookingId: booking?.bookingId ?? null,
+          seatId: booking?.seatId ?? null, ts: Date.now(),
+        }));
+      } catch (error) {
+        this.logger.warn(JSON.stringify({
+          event: 'booking_verification_error', taskId: task.id,
+          errorName: (error as Error).name, ts: Date.now(),
+        }));
+      }
+    };
+    const startVerification = (): void => {
+      if (verifiedBooking || verificationPromise || Date.now() - lastVerificationAt < 10_000) return;
+      lastVerificationAt = Date.now();
+      verificationPromise = verify().finally(() => { verificationPromise = null; });
+    };
+    const finishWithVerification = async (reason: string): Promise<void> => {
+      if (verificationPromise) await verificationPromise;
+      if (!verifiedBooking && (task.result?.reservationOutcomeUnknown || sawAlreadyBooked)) {
+        await verify();
+      }
+      if (verifiedBooking) {
+        await this.markSuccess(task, {
+          success: true, bookedSeatId: verifiedBooking.seatId,
+          seatTitle: verifiedBooking.seatTitle,
+        }, attempt, startMs, verifiedBooking);
+      } else {
+        await this.markFailed(task, reason, attempt, startMs);
+      }
+    };
 
     try {
     while (Date.now() < deadline) {
+      if (verifiedBooking) {
+        await finishWithVerification('');
+        return;
+      }
       if (this.grabTaskService.isCancellationRequested(task.id)) {
         this.logger.log(`[任务已被用户取消] taskId=${task.id}`);
         this.logTaskFinished(task.id, 'cancelled', null, attempt, startMs);
@@ -502,6 +649,7 @@ export class GrabSeatWorker {
       }
 
       const seat = queue[0];
+      attemptedSeats.set(seat.seatId, seat.title);
       attempt++;
       this.fireAndForget(
         this.grabTaskService.incrementAttempts(task.id),
@@ -588,6 +736,11 @@ export class GrabSeatWorker {
       );
 
       const errorCategory = this.mapBookErrorToCategory(bookResult.errorCode);
+      // 连续无响应超时计数：收到任何服务端响应（哪怕是业务错误）即清零 ——
+      // 有响应就证明服务端活着，只有纯超时才累计保险丝
+      if (errorCategory !== ErrorCategory.NETWORK) {
+        consecutiveNetworkErrors = 0;
+      }
       this.logger.log(
         `[盲抢第 ${attempt} 次尝试结果] taskId=${task.id} seat=${seat.title}(${seat.seatId}) ` +
           `errorCategory=${errorCategory} errorMessage=${bookResult.errorMessage ?? '-'}`,
@@ -596,7 +749,6 @@ export class GrabSeatWorker {
       // ---- 状态机出口 ----
       if (errorCategory === ErrorCategory.WINDOW_NOT_OPEN) {
         consecutiveWindowNotOpen++;
-        consecutiveNetworkErrors = 0;
         const interval =
           consecutiveWindowNotOpen < RETRY_CONFIG.windowNotOpenDegradeThreshold
             ? this.jitterMs(RETRY_CONFIG.blindWindowNotOpenIntervalMs)
@@ -611,7 +763,6 @@ export class GrabSeatWorker {
       consecutiveWindowNotOpen = 0;
 
       if (errorCategory === ErrorCategory.RATE_LIMIT) {
-        consecutiveNetworkErrors = 0;
         if (
           await this.sleepInterruptible(
             Math.min(this.jitterMs(RETRY_CONFIG.blindRateLimitBackoffMs), deadline - Date.now()),
@@ -625,7 +776,6 @@ export class GrabSeatWorker {
       }
 
       if (errorCategory === ErrorCategory.SEAT_UNAVAILABLE) {
-        consecutiveNetworkErrors = 0;
         // 座位被占：不弃座、不终止、不降频（8/24 用户裁决：被占可能是瞬态假象——
         // 网页端"看着被占、多试几次又能选"是常态；且他人取消会释放座位）。
         // 轮转到下一个候选（单座位即重试本座），以常规重试频率持续打到窗口结束
@@ -658,36 +808,66 @@ export class GrabSeatWorker {
           );
           return;
         }
-        continue; // 会话已刷新，立即重试同座位
+        // 刷新极快时仍守住同账号两次预约请求之间的最短间隔。
+        const sessionRetryWaitMs = Math.max(
+          0,
+          RETRY_CONFIG.blindWindowNotOpenIntervalMs - (Date.now() - bookStartMs),
+        );
+        if (sessionRetryWaitMs > 0 && await this.sleepInterruptible(sessionRetryWaitMs, task.id)) {
+          this.logTaskFinished(task.id, 'cancelled', null, attempt, startMs);
+          return;
+        }
+        continue;
+      }
+
+      if (errorCategory === ErrorCategory.ALREADY_BOOKED) {
+        sawAlreadyBooked = true;
+        task.result = { ...(task.result ?? {}), reservationOutcomeUnknown: true };
+        startVerification();
+        // 文案本身无法区分其它预约和本任务超时后被受理的预约。
+        // 后台精确核对进行中时继续轮转候选；核对命中后立即收尾。
+        queue.push(queue.shift()!);
+        if (
+          await this.sleepInterruptible(
+            Math.min(this.jitterMs(RETRY_CONFIG.blindWindowNotOpenIntervalMs), deadline - Date.now()),
+            task.id,
+          )
+        ) {
+          this.logTaskFinished(task.id, 'cancelled', null, attempt, startMs);
+          return;
+        }
+        continue;
       }
 
       if (errorCategory === ErrorCategory.NETWORK) {
         consecutiveNetworkErrors++;
-        // book 超时 ≠ 失败：服务端可能已受理。先 search 确认座位真实状态，
-        // 仍空闲(state=0) → 肯定没约上，重试；非空闲 → 可能是自己的预约生效，也可能是被抢 → 换座
-        const confirmed = await this.confirmSeatState(
-          task,
-          preparsed.roomId,
-          seat,
-        );
-        if (confirmed === 'available') {
-          if (consecutiveNetworkErrors >= RETRY_CONFIG.blindMaxConsecutiveNetworkErrors) {
-            await this.markFailed(task, '连续网络异常，盲抢终止', attempt, startMs);
-            return;
-          }
+        // 响应丢失时预约可能已受理；终态诊断保留“结果未知”，不误报确定未预约。
+        task.result = { ...(task.result ?? {}), reservationOutcomeUnknown: true };
+        this.logger.warn(JSON.stringify({
+          event: 'reservation_outcome_unknown',
+          taskId: task.id,
+          seatId: seat.seatId,
+          attempt,
+          ts: Date.now(),
+        }));
+        // book 超时 ≠ 失败，也不再 search 确认（9/12 复盘：拥堵期 confirm 自己也超时，
+        // 每轮白烧 8~15s，且其三种返回值对单座位队列收敛为同一动作"重试本座"）。
+        // 直接短退避重试同座位；“已有预约”不能证明本次指定座位/时段成功，
+        // 后续明确成功响应才收尾为成功，其余未知结果保留待核实标记。
+        if (consecutiveNetworkErrors >= RETRY_CONFIG.blindMaxConsecutiveNetworkErrors) {
+          await finishWithVerification('连续网络异常，预约结果未知，需核实');
+          return;
+        }
+        if (
           await this.sleepInterruptible(
             Math.min(this.jitterMs(RETRY_CONFIG.blindNetworkBackoffMs), deadline - Date.now()),
             task.id,
-          );
-          continue; // 重试同座位
+          )
+        ) {
+          this.logTaskFinished(task.id, 'cancelled', null, attempt, startMs);
+          return;
         }
-        // 状态未知或非空闲：按被占处理 —— 同样不弃座不终止，轮转继续打到窗口结束
-        queue.push(queue.shift()!);
-        await this.sleepInterruptible(
-          Math.min(this.jitterMs(RETRY_CONFIG.blindWindowNotOpenIntervalMs), deadline - Date.now()),
-          task.id,
-        );
-        continue;
+        continue; // 重试同座位
       }
 
       // 不可重试错误（黑名单/参数错误等）
@@ -723,7 +903,7 @@ export class GrabSeatWorker {
         startMs,
       );
     } else {
-      await this.markFailed(task, '超出时间窗口（盲抢）', attempt, startMs);
+      await finishWithVerification('超出时间窗口（盲抢）');
     }
   }
 
@@ -832,48 +1012,6 @@ export class GrabSeatWorker {
   }
 
   /**
-   * book 网络超时后的座位状态确认：search 该房间一次，返回目标座位当前状态
-   * @returns 'available' 空闲可约 / 'taken' 非空闲 / 'unknown' 查询失败
-   */
-  private async confirmSeatState(
-    task: GrabTask,
-    roomId: string,
-    seat: PreparsedSeat,
-  ): Promise<'available' | 'taken' | 'unknown'> {
-    try {
-      const searchResult = await this.hduLibraryClient.searchSeats(
-        {
-          beginTime: Number(task.beginTime),
-          duration: task.duration,
-          num: 1,
-          space_category: {
-            category_id: task.categoryId,
-            content_id: task.contentId,
-          },
-        },
-        task.accountId,
-        task.id,
-      );
-      // 优先在房间目录里找目标房间（search 推荐房间会轮换），退化为 seats 主列表
-      const room =
-        searchResult.allRooms?.find((r) => r.id === roomId) ??
-        (searchResult.room.id === roomId
-          ? { id: searchResult.room.id, name: searchResult.room.name, seats: searchResult.seats }
-          : null);
-      if (!room) {
-        return 'unknown';
-      }
-      const found = room.seats.find((s) => s.id === seat.seatId);
-      return found && found.state === 0 ? 'available' : 'taken';
-    } catch (e) {
-      this.logger.warn(
-        `[确认座位状态失败] taskId=${task.id} seat=${seat.seatId} message=${(e as Error).message}`,
-      );
-      return 'unknown';
-    }
-  }
-
-  /**
    * 单次抢座尝试：包含 searchSeats + bookSeats 全流程
    * @param notifiedTakenSeats 已提醒过的被占座位集合（跨尝试去重）
    * @returns 抢座结果 + 本轮耗时信息（埋点）
@@ -882,6 +1020,7 @@ export class GrabSeatWorker {
     task: GrabTask,
     notifiedTakenSeats: Set<string>,
     retryRound: number,
+    attemptedSeats?: Map<string, string>,
   ): Promise<TryGrabOnceResult> {
     const timing: AttemptTiming = { searchStartMs: Date.now(), books: [] };
 
@@ -978,7 +1117,7 @@ export class GrabSeatWorker {
       return { ...result, timing };
     }
 
-    // 任务指定 roomId 时锁定目标房间座位表（与盲抢预解析/confirmSeatState 一致）：
+    // 任务指定 roomId 时锁定目标房间座位表（与盲抢预解析一致）：
     // search 推荐房间在多房间分类下会轮换，直接用推荐房间会查错房间
     // （同名座位号在别的房间被占，会被误报占座并分配到别的房间的座位）
     let roomSeats = searchResult.seats;
@@ -1069,6 +1208,8 @@ export class GrabSeatWorker {
 
     // 依次尝试候选座位
     for (const seatId of candidates) {
+      const candidateSeat = roomSeats.find((seat) => seat.id === seatId);
+      if (candidateSeat) attemptedSeats?.set(seatId, candidateSeat.title);
       const bookStartMs = Date.now();
       const bookResult = await this.hduLibraryClient.bookSeats({
         beginTime: task.beginTime,
@@ -1162,6 +1303,8 @@ export class GrabSeatWorker {
     switch (code) {
       case BookErrorCode.SEAT_TAKEN:
         return ErrorCategory.SEAT_UNAVAILABLE;
+      case BookErrorCode.ALREADY_BOOKED:
+        return ErrorCategory.ALREADY_BOOKED;
       case BookErrorCode.BLACKLISTED:
         return ErrorCategory.BLACKLIST;
       case BookErrorCode.NOT_LOGIN:
@@ -1202,11 +1345,18 @@ export class GrabSeatWorker {
   /**
    * 标记任务成功并通知
    */
-  private async markSuccess(task: GrabTask, result: GrabResult, totalRounds: number, startMs: number): Promise<void> {
+  private async markSuccess(task: GrabTask, result: GrabResult, totalRounds: number, startMs: number, verifiedBooking?: VerifiedBooking): Promise<void> {
     await this.grabTaskService.updateStatus(task.id, TaskStatus.SUCCESS, {
       seatId: result.bookedSeatId,
       seatTitle: result.seatTitle,
+      ...(verifiedBooking ? { bookingId: verifiedBooking.bookingId, verificationSource: 'school_booking_list' } : {}),
     });
+    this.logger.log(JSON.stringify({
+      event: 'task_status_persisted', taskId: task.id, status: 'success',
+      seatId: result.bookedSeatId ?? null, seatTitle: result.seatTitle ?? null,
+      totalRounds, reservationOutcomeUnknown: false,
+      verificationSource: verifiedBooking ? 'school_booking_list' : 'book_response', ts: Date.now(),
+    }));
     await this.notification.notify({
       userId: task.accountId,
       taskId: task.id,
@@ -1239,12 +1389,23 @@ export class GrabSeatWorker {
     // V4 防覆盖：终态合并写而非整体替换，保留运行期写入的 preparse / takenSeats 诊断现场
     const failureCategory = this.classifyFailureReason(reason);
     const existingResult = (await this.grabTaskService.findById(task.id))?.result ?? task.result ?? {};
-    const mergedResult = { ...existingResult, reason, failureCategory };
-    await this.grabTaskService.updateStatus(task.id, TaskStatus.FAILED, mergedResult);
+    const mergedResult = {
+      ...existingResult,
+      ...(task.result?.reservationOutcomeUnknown ? { reservationOutcomeUnknown: true } : {}),
+      reason,
+      failureCategory,
+    };
+    const status = mergedResult.reservationOutcomeUnknown ? TaskStatus.UNCERTAIN : TaskStatus.FAILED;
+    await this.grabTaskService.updateStatus(task.id, status, mergedResult);
+    this.logger.log(JSON.stringify({
+      event: 'task_status_persisted', taskId: task.id, status,
+      failureCategory, totalRounds,
+      reservationOutcomeUnknown: Boolean(mergedResult.reservationOutcomeUnknown), ts: Date.now(),
+    }));
     await this.notification.notify({
       userId: task.accountId,
       taskId: task.id,
-      type: 'grab_failed',
+      type: status === TaskStatus.UNCERTAIN ? 'grab_uncertain' : 'grab_failed',
       data: {
         errorReason: reason,
       },
@@ -1256,7 +1417,7 @@ export class GrabSeatWorker {
       JSON.stringify({
         event: 'task_finished',
         taskId: task.id,
-        result: 'failed',
+        result: status,
         failureCategory,
         reason,
         seatId: null,

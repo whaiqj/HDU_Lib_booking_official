@@ -1,0 +1,292 @@
+{
+  "recentAttempts": [
+    {
+      "username": "23280301",
+      "id": "594d1d6e-e8ba-4e01-b6e2-619404284cd0",
+      "status": "failed",
+      "seatId": "-",
+      "result": "failed",
+      "errorMsg": "未能从 searchSeats 提取预约人 userInfo.id",
+      "bookStartMs": null,
+      "bookEndMs": null
+    },
+    {
+      "username": "23280518",
+      "id": "b61b8af3-92ac-4986-b1b2-b88a1adf6b1d",
+      "status": "failed",
+      "seatId": "-",
+      "result": "failed",
+      "errorMsg": "未能从 searchSeats 提取预约人 userInfo.id",
+      "bookStartMs": null,
+      "bookEndMs": null
+    },
+    {
+      "username": "23280301",
+      "id": "a302f3e5-c6ce-4068-bcb3-c6e3456199e7",
+      "status": "success",
+      "seatId": "63105",
+      "result": "success",
+      "errorMsg": null,
+      "bookStartMs": 1791892805052,
+      "bookEndMs": 1791892810906
+    },
+    {
+      "username": "23280518",
+      "id": "b0ef736f-9cf3-49e3-ab24-ac7a93948bf6",
+      "status": "cancelled",
+      "seatId": "63106",
+      "result": "failed",
+      "errorMsg": "timeout of 8000ms exceeded",
+      "bookStartMs": 1791892805106,
+      "bookEndMs": 1791892813109
+    },
+    {
+      "username": "23280518",
+      "id": "b0ef736f-9cf3-49e3-ab24-ac7a93948bf6",
+      "status": "cancelled",
+      "seatId": "63106",
+      "result": "failed",
+      "errorMsg": "timeout of 15000ms exceeded",
+      "bookStartMs": 1791892814034,
+      "bookEndMs": 1791892829036
+    },
+    {
+      "username": "23280518",
+      "id": "b0ef736f-9cf3-49e3-ab24-ac7a93948bf6",
+      "status": "cancelled",
+      "seatId": "63106",
+      "result": "failed",
+      "errorMsg": "timeout of 15000ms exceeded",
+      "bookStartMs": 1791892829954,
+      "bookEndMs": 1791892844959
+    },
+    {
+      "username": "23280518",
+      "id": "b0ef736f-9cf3-49e3-ab24-ac7a93948bf6",
+      "status": "cancelled",
+      "seatId": "63106",
+      "result": "failed",
+      "errorMsg": "timeout of 15000ms exceeded",
+      "bookStartMs": 1791892845870,
+      "bookEndMs": 1791892860873
+    }
+  ],
+  "failureCounts": [
+    {
+      "id": "6e665b9a-0e08-4d56-a650-c04da7e17cc0",
+      "status": "cancelled",
+      "errorMsg": "选择的座位无法预约，可能座位不可用或已经被其他人锁定或占用，请换一个再试:1445580629",
+      "n": 10
+    },
+    {
+      "id": "6e665b9a-0e08-4d56-a650-c04da7e17cc0",
+      "status": "cancelled",
+      "errorMsg": "选择的座位无法预约，可能座位不可用或已经被其他人锁定或占用，请换一个再试:1445580661",
+      "n": 9
+    },
+    {
+      "id": "6e665b9a-0e08-4d56-a650-c04da7e17cc0",
+      "status": "cancelled",
+      "errorMsg": "timeout of 8000ms exceeded",
+      "n": 1
+    },
+    {
+      "id": "6e665b9a-0e08-4d56-a650-c04da7e17cc0",
+      "status": "cancelled",
+      "errorMsg": "timeout of 12057ms exceeded",
+      "n": 2
+    },
+    {
+      "id": "6e665b9a-0e08-4d56-a650-c04da7e17cc0",
+      "status": "cancelled",
+      "errorMsg": "请求太频繁了，请稍后再试",
+      "n": 1
+    },
+    {
+      "id": "a13d625f-a77d-4d25-8b33-f1dfa19831a0",
+      "status": "failed",
+      "errorMsg": "选择的座位无法预约，可能座位不可用或已经被其他人锁定或占用，请换一个再试:1443958190",
+      "n": 30
+    },
+    {
+      "id": "a13d625f-a77d-4d25-8b33-f1dfa19831a0",
+      "status": "failed",
+      "errorMsg": "请求太频繁了，请稍后再试",
+      "n": 16
+    },
+    {
+      "id": "a13d625f-a77d-4d25-8b33-f1dfa19831a0",
+      "status": "failed",
+      "errorMsg": "timeout of 8000ms exceeded",
+      "n": 1
+    },
+    {
+      "id": "a13d625f-a77d-4d25-8b33-f1dfa19831a0",
+      "status": "failed",
+      "errorMsg": "timeout of 15000ms exceeded",
+      "n": 2
+    }
+  ],
+  "pending": [
+    {
+      "username": "23280301",
+      "id": "36b10a38-cc6f-433d-a58f-11938721a3bb",
+      "beginTime": 1792108800,
+      "triggerAt": 1791979200,
+      "duration": 50400,
+      "seatPreference": "[\"209\",\"208\",\"207\",\"206\"]",
+      "strictMode": 1,
+      "status": "pending"
+    },
+    {
+      "username": "23280518",
+      "id": "5e7bf128-6b63-424e-96f4-f9f5baa934c8",
+      "beginTime": 1792108800,
+      "triggerAt": 1791979200,
+      "duration": 50400,
+      "seatPreference": "[\"210\",\"205\",\"204\",\"203\",\"201\"]",
+      "strictMode": 1,
+      "status": "pending"
+    }
+  ],
+  "mapping": [
+    {
+      "title": "201",
+      "seatId": "63097",
+      "updatedAt": "2026-10-13T14:54:39.524Z"
+    },
+    {
+      "title": "203",
+      "seatId": "63099",
+      "updatedAt": "2026-10-13T14:54:39.524Z"
+    },
+    {
+      "title": "204",
+      "seatId": "63100",
+      "updatedAt": "2026-10-13T14:54:39.524Z"
+    },
+    {
+      "title": "205",
+      "seatId": "63101",
+      "updatedAt": "2026-10-13T14:54:39.524Z"
+    },
+    {
+      "title": "206",
+      "seatId": "63102",
+      "updatedAt": "2026-10-13T14:54:39.524Z"
+    },
+    {
+      "title": "207",
+      "seatId": "63103",
+      "updatedAt": "2026-10-13T14:54:39.524Z"
+    },
+    {
+      "title": "208",
+      "seatId": "63104",
+      "updatedAt": "2026-10-13T14:54:39.524Z"
+    },
+    {
+      "title": "209",
+      "seatId": "63105",
+      "updatedAt": "2026-10-13T14:54:39.524Z"
+    },
+    {
+      "title": "210",
+      "seatId": "63106",
+      "updatedAt": "2026-10-13T14:54:39.524Z"
+    }
+  ],
+  "userCache": [
+    {
+      "username": "23280301",
+      "cached": 1,
+      "updatedAt": "2026-09-10T11:55:01.506Z"
+    },
+    {
+      "username": "23280518",
+      "cached": 1,
+      "updatedAt": "2026-09-10T11:55:01.429Z"
+    }
+  ],
+  "experiment": [
+    {
+      "event": "experiment_start",
+      "ts": "2026-10-13T11:57:00.357Z",
+      "mode": "single_booking",
+      "triggerAt": "2026-10-13T20:00:00+08:00",
+      "fireAt": "2026-10-13T12:00:03.000Z",
+      "beginAt": "2026-10-15T08:00:00+08:00",
+      "duration": 50400,
+      "roomId": "1559",
+      "seatTitle": "202",
+      "offsetMs": 3000
+    },
+    {
+      "event": "authentication_ready",
+      "ts": "2026-10-13T11:57:02.671Z"
+    },
+    {
+      "event": "mapping_check",
+      "ts": "2026-10-13T11:57:03.429Z",
+      "round": 1,
+      "resolved": true,
+      "httpStatus": 200,
+      "elapsedMs": 745
+    },
+    {
+      "event": "preparation_ready",
+      "ts": "2026-10-13T11:57:03.429Z",
+      "roomId": "1559",
+      "seatTitle": "202",
+      "seatId": "63098"
+    },
+    {
+      "event": "booking_invoked",
+      "ts": "2026-10-13T12:00:03.001Z",
+      "issuedAt": "2026-10-13T12:00:03.001Z",
+      "offsetFromTriggerMs": 3001,
+      "lateMs": 1,
+      "count": 1
+    },
+    {
+      "event": "request_written",
+      "ts": "2026-10-13T12:00:03.017Z",
+      "socketAssignedMs": 2,
+      "dnsMs": 3,
+      "tcpMs": 9,
+      "tlsMs": 16,
+      "requestFinishedAt": "2026-10-13T12:00:03.017Z",
+      "requestFinishedMs": 16,
+      "reusedSocket": false
+    },
+    {
+      "event": "booking_result",
+      "ts": "2026-10-13T12:00:05.087Z",
+      "category": "success",
+      "resultCertain": true,
+      "httpStatus": 200,
+      "applicationCode": "ok",
+      "elapsedMs": 2086,
+      "serverDate": "Tue, 13 Oct 2026 12:00:05 GMT",
+      "reusedSocket": false,
+      "timings": {
+        "socketAssignedMs": 2,
+        "dnsMs": 3,
+        "tcpMs": 9,
+        "tlsMs": 16,
+        "requestFinishedAt": "2026-10-13T12:00:03.017Z",
+        "requestFinishedMs": 16,
+        "responseHeadersMs": 2085
+      },
+      "responseHash": "6fc7111d6b94a31317b22211490250d89226bca3a59df629c8e9e004617855a8"
+    },
+    {
+      "event": "experiment_finished",
+      "ts": "2026-10-13T12:00:05.087Z",
+      "requestsIssued": 1,
+      "retry": false
+    }
+  ],
+  "runtime": "sha256:270710f5bf4216f2dcd162cd9236b64260e8362c97ff6caec1145ab9ff7241e2 healthy 0",
+  "queueJobs": "grab-seat-precheck-36b10a38-cc6f-433d-a58f-11938721a3bb\n7339945574404096\ngrab-seat-precheck-5e7bf128-6b63-424e-96f4-f9f5baa934c8\n7339945574404097\ngrab-seat-36b10a38-cc6f-433d-a58f-11938721a3bb\n7339946803200000\ngrab-seat-5e7bf128-6b63-424e-96f4-f9f5baa934c8\n7339946803200001"
+}

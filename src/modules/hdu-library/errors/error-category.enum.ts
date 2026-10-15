@@ -13,6 +13,12 @@ export enum ErrorCategory {
   BLACKLIST = 'blacklist',
   /** 座位已被占用、座位不存在、座位已锁定 */
   SEAT_UNAVAILABLE = 'seat_unavailable',
+  /**
+   * 已有预约 / 重复预约 —— 来源不可区分：可能是账号已有的其它预约，
+   * 也可能是本任务超时后被受理（响应丢失）。上层只能在学校预约详情
+   * 精确匹配后记成功；否则按可重试继续打（9/16 用户裁决）。
+   */
+  ALREADY_BOOKED = 'already_booked',
   /** 超出每日预约上限、时间段已关闭、预约时长超限 */
   BUSINESS_RULE = 'business_rule',
   /** 超出可预约座位时间范围（还没到放号时间点）—— 可重试且可缩短间隔 */

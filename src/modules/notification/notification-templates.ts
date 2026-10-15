@@ -112,6 +112,18 @@ export function buildFailedMessage(d: NotificationTemplateData): string {
   ].join('\n');
 }
 
+/** A request timed out and the school booking record could not be confirmed. */
+export function buildUncertainMessage(d: NotificationTemplateData): string {
+  return [
+    '## ⚠️ 预约结果待核实',
+    '',
+    `- **账号**：${d.accountUsername}`,
+    `- **房间**：${d.room}`,
+    `- **时间**：${d.date} ${d.timeStart} - ${d.timeEnd}`,
+    '- **说明**：预约请求曾超时，学校记录暂未确认，请在“我的预约”核对。',
+  ].join('\n');
+}
+
 /** 图书馆预约消息分级模板渲染所需的统一数据 */
 export interface AppointMessageTemplateData {
   accountUsername: string;

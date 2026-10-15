@@ -17,6 +17,8 @@ import type { IAuthKeeperService } from '../session/auth-keeper.service';
 import { LIBRARY_API } from '../../common/constants/api-endpoints';
 import { buildFormBody, FORM_CONTENT_TYPE } from '../../common/utils/form-urlencoded.util';
 import type { AppointmentMessageItem } from './dto/appoint-messages.dto';
+import type { BookingMatchQuery, VerifiedBooking } from './dto/verified-booking.dto';
+import { bookTimeoutStage, createBookTransportTrace } from './book-transport-trace';
 
 /**
  * 明确登录失效错误
@@ -67,11 +69,14 @@ export class HduLibraryClientService {
   // RTT 滑动窗口：search 和 book 是两种量级的耗时分布，分开追踪，避免互相污染估计值
   private readonly searchRttWindow: number[] = [];
   private readonly bookRttWindow: number[] = [];
+  private readonly bookRequestSequence = new Map<string, number>();
   private readonly messageRttWindow: number[] = [];
   private readonly RTT_WINDOW_SIZE = 5;
-  private readonly MIN_TIMEOUT_MS = 8_000;   // 硬下限 8 秒
+  private readonly MIN_TIMEOUT_MS = 8_000;   // search/message 硬下限 8 秒
   private readonly MAX_TIMEOUT_MS = 15_000;  // 硬上限 15 秒
-  private readonly RTT_MULTIPLIER = 3;       // RTT 倍数
+  private readonly RTT_MULTIPLIER = 3;       // RTT 倍数（search/message）
+  /** 预约固定等待 8 秒；跨账号历史 RTT 不再拉长后续预约等待。超时结果仍未知。 */
+  private readonly BOOK_TIMEOUT_MS = 8_000;
 
   constructor(
     private readonly httpService: HttpService,
@@ -90,15 +95,22 @@ export class HduLibraryClientService {
     }
   }
 
-  /** 从滑动窗口计算自适应超时：max(中位数 × RTT_MULTIPLIER, MIN_TIMEOUT_MS)，硬上限 MAX_TIMEOUT_MS */
-  private computeAdaptiveTimeout(window: number[]): number {
+  /**
+   * 从滑动窗口计算自适应超时：max(中位数 × 倍数, 下限)，硬上限 MAX_TIMEOUT_MS。
+   * 用于 search/message；book 使用独立固定 8 秒超时。
+   */
+  private computeAdaptiveTimeout(
+    window: number[],
+    minTimeoutMs: number = this.MIN_TIMEOUT_MS,
+    rttMultiplier: number = this.RTT_MULTIPLIER,
+  ): number {
     if (window.length === 0) {
-      return this.MIN_TIMEOUT_MS; // 冷启动：8 秒
+      return minTimeoutMs; // 冷启动
     }
     const sorted = [...window].sort((a, b) => a - b);
     const median = sorted[Math.floor(sorted.length / 2)];
     return Math.min(
-      Math.max(median * this.RTT_MULTIPLIER, this.MIN_TIMEOUT_MS),
+      Math.max(median * rttMultiplier, minTimeoutMs),
       this.MAX_TIMEOUT_MS,
     );
   }
@@ -153,9 +165,6 @@ export class HduLibraryClientService {
       const msg = raw?.MESSAGE ?? raw?.DATA?.MESSAGE ?? '未知错误';
       const code = raw?.CODE;
       this.logger.warn(`taskId=${taskId} [searchSeats 返回业务错误] CODE=${code} MESSAGE=${msg}`);
-      // 异常时兜底打印完整原始响应
-      const rawStr = JSON.stringify(raw);
-      this.logger.debug(`taskId=${taskId} [searchSeats 异常原始响应] ${rawStr}`);
       const err = new Error(`searchSeats 业务错误: ${msg} (CODE=${code})`);
       (err as any).code = code;
       (err as any).message = msg;
@@ -171,26 +180,39 @@ export class HduLibraryClientService {
    * 返回标准化结果
    */
   async bookSeats(params: BookSeatsParams, accountId: string, taskId: string): Promise<BookSeatsResult> {
-    // 调试日志：打印实际发出的 beginTime 及对应北京时间（debug 级别，生产默认不输出）
-    const beginTimeBeijing = new Date(params.beginTime * 1000).toLocaleString('zh-CN', {
-      timeZone: 'Asia/Shanghai',
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', second: '2-digit',
-      hour12: false,
-    });
-    const apiTimeBeijing = new Date(params.api_time * 1000).toLocaleString('zh-CN', {
-      timeZone: 'Asia/Shanghai',
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', second: '2-digit',
-      hour12: false,
-    });
+    // Only non-secret parameters are logged; Cookie, Api-Token and userInfoId stay out of diagnostics.
     this.logger.debug(
-      `taskId=${taskId} [bookSeats 请求参数] beginTime=${params.beginTime} (北京时间: ${beginTimeBeijing}) ` +
-      `duration=${params.duration} seats=${params.seats.join(',')} ` +
-      `api_time=${params.api_time} (北京时间: ${apiTimeBeijing}) ` +
-      `seatBookers=${params.seatBookers.join(',')} is_recommend=${params.is_recommend}`,
+      `taskId=${taskId} [bookSeats 请求参数] beginTime=${params.beginTime} ` +
+      `duration=${params.duration} seats=${params.seats.join(',')} api_time=${params.api_time}`,
     );
 
+    const timeoutSamplesMs = [...this.bookRttWindow];
+    const requestSeq = (this.bookRequestSequence.get(taskId) ?? 0) + 1;
+    this.bookRequestSequence.set(taskId, requestSeq);
+    const timeoutMs = this.BOOK_TIMEOUT_MS;
+    const diagnostic = createBookTransportTrace();
+    const startedAtMs = Date.now();
+    const emitTrace = (outcome: string, httpStatus?: number, applicationCode?: unknown, errorCode?: unknown) => {
+      const safeCode = (value: unknown) =>
+        String(value ?? '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64) || null;
+      this.logger.log(JSON.stringify({
+        event: 'book_transport',
+        taskId,
+        accountId,
+        requestSeq,
+        seatId: params.seats[0] ?? null,
+        startedAtMs,
+        durationMs: diagnostic.elapsedMs(),
+        timeoutMs,
+        timeoutSamplesMs,
+        outcome,
+        timeoutStage: outcome === 'transport_error' ? bookTimeoutStage(diagnostic.trace) : null,
+        httpStatus: httpStatus ?? diagnostic.trace.httpStatus ?? null,
+        applicationCode: safeCode(applicationCode),
+        errorCode: safeCode(errorCode),
+        ...diagnostic.trace,
+      }));
+    };
     try {
       const bookStartMs = Date.now();
       const response = await firstValueFrom(
@@ -203,7 +225,8 @@ export class HduLibraryClientService {
               'Content-Type': FORM_CONTENT_TYPE,
               'Api-Token': signBookToken(params),
             },
-            timeout: this.computeAdaptiveTimeout(this.bookRttWindow),
+            timeout: timeoutMs,
+            transport: diagnostic.transport,
           },
         ),
       );
@@ -212,9 +235,8 @@ export class HduLibraryClientService {
 
       // 成功判定层级：DATA.result === 'success'（顶层无 result）
       if (raw?.DATA?.result === 'success') {
-        this.logger.debug(
-          `taskId=${taskId} [bookSeats 响应] code=success message=${raw?.MESSAGE ?? '预约成功'}`,
-        );
+        emitTrace('success', response.status, raw?.CODE);
+        this.logger.debug(`taskId=${taskId} [bookSeats 响应] code=success`);
         return {
           success: true,
           bookedSeatId: params.seats[0],
@@ -225,15 +247,9 @@ export class HduLibraryClientService {
       const errorCode = this.classifyBookError(raw);
       const code = raw?.CODE ?? raw?.code ?? 'unknown';
       const message = raw?.MESSAGE ?? raw?.msg ?? '';
-      this.logger.debug(
-        `taskId=${taskId} [bookSeats 响应] code=${code} message=${message}`,
-      );
+      this.logger.debug(`taskId=${taskId} [bookSeats 响应] code=${code}`);
 
-      // 若返回码不在已知枚举内，打印完整原始响应作为兜底
-      if (errorCode === BookErrorCode.UNKNOWN) {
-        const rawStr = JSON.stringify(raw);
-        this.logger.debug(`taskId=${taskId} [bookSeats 未知错误原始响应] ${rawStr}`);
-      }
+      emitTrace('business_error', response.status, code, errorCode);
 
       return {
         success: false,
@@ -241,6 +257,12 @@ export class HduLibraryClientService {
         errorMessage: message,
       };
     } catch (error) {
+      emitTrace(
+        (error as any)?.response ? 'http_error' : 'transport_error',
+        (error as any)?.response?.status,
+        (error as any)?.response?.data?.CODE,
+        (error as any)?.code,
+      );
       // 网络异常
       const category = classifyError(null, error);
       let errorCode: BookErrorCode;
@@ -252,9 +274,7 @@ export class HduLibraryClientService {
           errorCode = BookErrorCode.UNKNOWN;
       }
       const message = error.message ?? 'Network error';
-      this.logger.debug(
-        `taskId=${taskId} [bookSeats 网络异常] errorCode=${errorCode} message=${message}`,
-      );
+      this.logger.debug(`taskId=${taskId} [bookSeats 网络异常] errorCode=${errorCode}`);
       return {
         success: false,
         errorCode,
@@ -461,6 +481,8 @@ export class HduLibraryClientService {
     switch (category) {
       case 'seat_unavailable':
         return BookErrorCode.SEAT_TAKEN;
+      case 'already_booked':
+        return BookErrorCode.ALREADY_BOOKED;
       case 'blacklist':
         return BookErrorCode.BLACKLISTED;
       case 'session_expired':
@@ -474,6 +496,64 @@ export class HduLibraryClientService {
       default:
         return BookErrorCode.UNKNOWN;
     }
+  }
+
+  /**
+   * Read the account's own bookings and confirm a candidate through bookingInfo.
+   * Both endpoints are GETs. A list card alone cannot establish the room or seat ID.
+   * A missing match means "not confirmed", never "the timed-out booking failed".
+   */
+  async findMatchingBooking(accountId: string, query: BookingMatchQuery): Promise<VerifiedBooking | null> {
+    const seatsById = new Map(query.seats.map((seat) => [seat.seatId, seat.title]));
+    const wantedTitles = new Set(query.seats.map((seat) => seat.title));
+    let path = '/Seat/Index/myBookingList?LAB_JSON=1';
+
+    for (let page = 0; page < 2; page++) {
+      const response = await firstValueFrom(this.httpService.get(`${this.baseUrl}${path}`, {
+        headers: this.getAuthHeaders(accountId), timeout: 5_000, maxRedirects: 0,
+      }));
+      const raw = response.data;
+      if (raw?.is_login === false || !Array.isArray(raw?.content?.defaultItems)) {
+        throw new Error('myBookingList did not return an authenticated booking list');
+      }
+
+      for (const item of raw.content.defaultItems) {
+        if (String(item?.status) !== '0' ||
+            Number(item?.time) !== query.beginTime ||
+            Number(item?.duration) !== query.duration ||
+            !wantedTitles.has(String(item?.seatNum))) {
+          continue;
+        }
+        const bookingId = String(item?.id ?? '');
+        if (!/^\d+$/.test(bookingId)) continue;
+
+        const detail = await firstValueFrom(this.httpService.get(
+          `${this.baseUrl}/Seat/Index/bookingInfo?bookingId=${bookingId}&LAB_JSON=1`,
+          { headers: this.getAuthHeaders(accountId), timeout: 5_000, maxRedirects: 0 },
+        ));
+        const booking = detail.data?.data?.booking;
+        const seatId = String(booking?.seat?.id ?? '');
+        if (detail.data?.data?.is_login === false ||
+            String(booking?.id ?? '') !== bookingId ||
+            String(booking?.status) !== '0' ||
+            Number(booking?.begin_time) !== query.beginTime ||
+            Number(booking?.duration) !== query.duration ||
+            String(booking?.space?.id ?? '') !== query.roomId ||
+            !seatsById.has(seatId) ||
+            String(booking?.seat?.title ?? '') !== seatsById.get(seatId)) {
+          continue;
+        }
+        return {
+          bookingId, seatId, seatTitle: seatsById.get(seatId)!,
+          roomId: query.roomId, beginTime: query.beginTime, duration: query.duration,
+        };
+      }
+
+      const next = String(raw.content.defaultNextUrl ?? '');
+      if (!/^\/Seat\/Index\/myBookingList\?(?:[A-Za-z0-9_=&%-]+)$/.test(next)) break;
+      path = next;
+    }
+    return null;
   }
 
   /**

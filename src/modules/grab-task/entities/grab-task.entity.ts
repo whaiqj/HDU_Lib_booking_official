@@ -12,6 +12,8 @@ export enum TaskStatus {
   RUNNING = 'running',
   SUCCESS = 'success',
   FAILED = 'failed',
+  /** 预约请求已发出但学校结果未能核实，不能认定预约失败 */
+  UNCERTAIN = 'uncertain',
   /** 用户手动终止（pending 阶段取消或 running 阶段中途停止） */
   CANCELLED = 'cancelled',
 }

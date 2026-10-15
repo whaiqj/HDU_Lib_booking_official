@@ -56,7 +56,7 @@ const CACHE_TTL_MS = 10 * 60 * 1000;
  */
 const PREPARSE_MAX_ROUNDS = 3;
 /** 各轮 search 之间的间隔 */
-const PREPARSE_RETRY_DELAY_MS = 400;
+const PREPARSE_RETRY_DELAY_MS = 1_150;
 
 /**
  * 偏好座位预解析服务
@@ -160,6 +160,10 @@ export class SeatPreparseService {
     if (successRounds === 0) {
       // search 全部失败：尝试完全凭持久化缓存组装盲抢参数
       return this.buildEntryFromCache(task, lastFailReason || '座位搜索失败');
+    }
+
+    if (!userInfoId) {
+      userInfoId = await this.seatMappingCache.getUserInfoId(task.accountId) ?? '';
     }
 
     if (!userInfoId) {

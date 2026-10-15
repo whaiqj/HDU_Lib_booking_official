@@ -35,12 +35,15 @@ export async function createGrabTask(payload: CreateGrabTaskPayload) {
 
 export interface GrabTaskStatus {
   id: string;
-  status: "pending" | "running" | "success" | "failed" | "cancelled";
+  status: "pending" | "running" | "success" | "failed" | "uncertain" | "cancelled";
   attempts: number;
   result: {
     seatId?: string;
     seatTitle?: string;
     reason?: string;
+    reservationOutcomeUnknown?: boolean;
+    bookingId?: string;
+    verificationSource?: string;
     /** 运行中已被他人占用的座位（实时提醒） */
     takenSeats?: string[];
   } | null;

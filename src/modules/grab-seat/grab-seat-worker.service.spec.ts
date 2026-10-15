@@ -221,6 +221,21 @@ describe('GrabSeatWorker 预解析缓存清理', () => {
     expect(invalidate).toHaveBeenCalledWith('task-1');
   });
 
+  it('严格任务预解析失败时，查座回退的未开窗重试至少等待 1.15 秒', async () => {
+    const task = makeTask({ strictMode: true, seatPreference: ['001'] });
+    const sleep = jest.spyOn(worker as any, 'sleepInterruptible').mockResolvedValue(true);
+    jest.spyOn(worker as any, 'tryGrabOnce').mockResolvedValue({
+      success: false,
+      errorCategory: 'window_not_open',
+      timing: { searchStartMs: Date.now(), books: [] },
+    });
+
+    await worker.executeGrab(task);
+
+    expect(sleep).toHaveBeenCalledWith(expect.any(Number), task.id);
+    expect(sleep.mock.calls[0][0]).toBeGreaterThanOrEqual(1_150);
+  });
+
   it('Case 6b: 盲抢路径（缓存命中）—— 不经 searchSeats 直发 bookSeats，终态后缓存被清理', async () => {
     // triggerAt 设为过去：跳过盲抢起始偏移等待，避免测试真实 sleep
     const task = makeTask({

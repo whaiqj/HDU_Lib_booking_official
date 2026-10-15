@@ -337,11 +337,33 @@ export class RealAuthKeeperService implements IAuthKeeperService, OnModuleInit {
   ): Promise<void> {
     this.logger.log(`[登录触发] accountId=${accountId} username=${username} trigger=${trigger}`);
 
-    const result = await casLogin({
-      username,
-      password,
-      serviceUrl: this.serviceUrl,
-    });
+    const loginStartedAtMs = Date.now();
+    let lastStage = 'start';
+    let result: Awaited<ReturnType<typeof casLogin>>;
+    try {
+      result = await casLogin({
+        username,
+        password,
+        serviceUrl: this.serviceUrl,
+        onStage: (stage, elapsedMs, status) => {
+          lastStage = stage;
+          this.logger.log(JSON.stringify({
+            event: 'cas_stage', accountId, trigger, stage, elapsedMs,
+            httpStatus: status ?? null, ts: Date.now(),
+          }));
+        },
+      });
+    } catch (error) {
+      const message = String((error as Error).message ?? '');
+      this.logger.warn(JSON.stringify({
+        event: 'cas_failed', accountId, trigger, lastStage,
+        elapsedMs: Date.now() - loginStartedAtMs,
+        errorClass: message.includes('超时') || message.includes('timeout')
+          ? 'timeout' : message.includes('ticket') ? 'ticket_missing' : 'other',
+        ts: Date.now(),
+      }));
+      throw error;
+    }
 
     // 将 cookies Record 转为 cookie header 字符串
     const cookieString = Object.entries(result.cookies)
@@ -355,7 +377,7 @@ export class RealAuthKeeperService implements IAuthKeeperService, OnModuleInit {
     }
 
     this.logger.log(
-      `登录成功: ${username}，获取到 ${Object.keys(result.cookies).length} 个 cookie，ticket=${result.ticket}`,
+      `登录成功: ${username}，获取到 ${Object.keys(result.cookies).length} 个 cookie`,
     );
   }
 

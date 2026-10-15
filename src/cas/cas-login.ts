@@ -81,7 +81,7 @@ async function fetchWithTimeout(
     return await fetch(url, { ...init, signal: controller.signal });
   } catch (e: any) {
     if (e.name === 'AbortError') {
-      throw new Error(`[${label}] 请求超时 (${timeoutMs}ms): url=${url}`);
+      throw new Error(`[${label}] 请求超时 (${timeoutMs}ms)`);
     }
     throw e;
   } finally {
@@ -144,9 +144,9 @@ async function followRedirects(
         `followRedirects hop ${i + 1}`,
       );
     } catch (e: any) {
-      const cause = e.cause;
-      const causeMsg = cause ? ` (${cause.message ?? cause.code ?? cause})` : '';
-      throw new Error(`followRedirects 请求失败: url=${url}, error=${e.message}${causeMsg}`);
+      const causeCode = String(e.message?.includes('请求超时') ? 'timeout' : (e.cause?.code ?? e.code ?? e.name ?? 'request_error'))
+        .replace(/[^A-Za-z0-9_-]/g, '').slice(0, 48);
+      throw new Error(`followRedirects hop ${i + 1} 请求失败: ${causeCode}`);
     }
     jar.absorb(res);
     const loc = res.headers.get('location');
@@ -167,6 +167,8 @@ export interface CasLoginOptions {
   requestTimeoutMs?: number;
   /** 整次登录总超时（毫秒），默认 30s */
   totalTimeoutMs?: number;
+  /** Safe, credential-free progress events for correlated diagnostics. */
+  onStage?: (stage: string, elapsedMs: number, status?: number) => void;
 }
 
 export async function casLogin(opts: CasLoginOptions): Promise<CasLoginResult> {
@@ -176,6 +178,7 @@ export async function casLogin(opts: CasLoginOptions): Promise<CasLoginResult> {
     serviceUrl,
     requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
     totalTimeoutMs = DEFAULT_TOTAL_TIMEOUT_MS,
+    onStage,
   } = opts;
   if (!serviceUrl) throw new Error('缺少 serviceUrl(图书馆系统的 CAS 回调地址)');
 
@@ -183,6 +186,10 @@ export async function casLogin(opts: CasLoginOptions): Promise<CasLoginResult> {
   const totalController = new AbortController();
   const totalTimer = setTimeout(() => totalController.abort(), totalTimeoutMs);
   const totalTimeoutError = () => new Error(`CAS 登录总超时 (${totalTimeoutMs}ms)`);
+  const startedAtMs = Date.now();
+  const mark = (stage: string, status?: number) => {
+    try { onStage?.(stage, Date.now() - startedAtMs, status); } catch { /* diagnostics must not affect login */ }
+  };
 
   try {
     const jar = new CookieJar();
@@ -204,9 +211,7 @@ export async function casLogin(opts: CasLoginOptions): Promise<CasLoginResult> {
       );
     } catch (e: any) {
       if (e.name === 'AbortError' && totalController.signal.aborted) throw totalTimeoutError();
-      const cause = e.cause;
-      const causeMsg = cause ? ` (${cause.message ?? cause.code ?? cause})` : '';
-      throw new Error(`获取 SSO 登录页失败: url=${loginPageUrl}, error=${e.message}${causeMsg}`);
+      throw new Error(`获取 SSO 登录页失败: ${e.name === 'AbortError' ? 'timeout' : 'request_error'}`);
     }
     jar.absorb(pageRes);
     let html = await pageRes.text();
@@ -229,8 +234,7 @@ export async function casLogin(opts: CasLoginOptions): Promise<CasLoginResult> {
     }
     const croypto = extractHidden(html, 'login-croypto');
     const flowkey = extractHidden(html, 'login-page-flowkey');
-    console.log(`[cas] 拿到登录页:SESSION=${jar.header.includes('SESSION') ? 'ok' : 'MISSING'},` +
-      ` croypto=${croypto}, flowkey 长度=${flowkey.length}`);
+    mark('login_page_ready', pageRes.status);
 
     // 2. 构造表单并 POST /login
     if (totalController.signal.aborted) throw totalTimeoutError();
@@ -267,9 +271,7 @@ export async function casLogin(opts: CasLoginOptions): Promise<CasLoginResult> {
       );
     } catch (e: any) {
       if (e.name === 'AbortError' && totalController.signal.aborted) throw totalTimeoutError();
-      const cause = e.cause;
-      const causeMsg = cause ? ` (${cause.message ?? cause.code ?? cause})` : '';
-      throw new Error(`提交 SSO 登录失败: url=${SSO_BASE}/login, error=${e.message}${causeMsg}`);
+      throw new Error(`提交 SSO 登录失败: ${e.name === 'AbortError' ? 'timeout' : 'request_error'}`);
     }
     jar.absorb(postRes);
 
@@ -277,20 +279,15 @@ export async function casLogin(opts: CasLoginOptions): Promise<CasLoginResult> {
     const ticket = location.match(/[?&]ticket=([^&]+)/)?.[1] ?? null;
 
     if (!ticket) {
-      // 失败:一般 302 回登录页带 error 参数,或 200 返回错误页
-      const body = await postRes.text();
-      throw new Error(
-        `未获取到 ticket(status=${postRes.status}, location=${location || '无'}, ` +
-          `body 片段=${body.slice(0, 300).replace(/\s+/g, ' ')})`,
-      );
+      throw new Error(`未获取到 ticket(status=${postRes.status})`);
     }
-    console.log(`[cas] 登录成功,ticket=${ticket}`);
+    mark('ticket_received', postRes.status);
 
     // 3. 带 ticket 回业务系统,跟随 302 链收取业务 Cookie
     if (totalController.signal.aborted) throw totalTimeoutError();
     const callbackUrl = new URL(location, SSO_BASE).toString();
     const final = await followRedirects(callbackUrl, jar, requestTimeoutMs);
-    console.log(`[cas] 业务系统落地:status=${final.status}, url=${final.url}`);
+    mark('service_landed', final.status);
 
     return {
       cookies: Object.fromEntries(jar.header.split('; ').filter(Boolean).map((p) => {
@@ -315,7 +312,7 @@ if (process.argv[1] && process.argv[1].endsWith('cas-login.ts')) {
   }
   casLogin({ username: USERNAME, password: PASSWORD, serviceUrl: SERVICE_URL })
     .then((r) => {
-      console.log('[cas] 最终 Cookie:', r.cookies);
+      console.log('[cas] 登录完成:', Object.keys(r.cookies).length, '个 Cookie');
     })
     .catch((e) => {
       console.error('[cas] 登录失败:', e.message);

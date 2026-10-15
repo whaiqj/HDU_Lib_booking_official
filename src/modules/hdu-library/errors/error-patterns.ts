@@ -7,6 +7,10 @@ import { ErrorCategory } from './error-category.enum';
  * 正式接入前建议手动触发失败场景，收集真实错误文案再补全
  */
 export const ERROR_PATTERNS: Record<ErrorCategory, RegExp[]> = {
+  // ALREADY_BOOKED 必须排在 SEAT_UNAVAILABLE 之前：其文案与"座位已被预约"字面接近，
+  // Object.entries() 按插入顺序遍历，先命中先分类。
+  // 分类仅用于识别，worker 按可重试继续打，不再当作成功信号（9/16 用户裁决）
+  [ErrorCategory.ALREADY_BOOKED]: [/已有预约/, /重复预约/, /已预约过/],
   [ErrorCategory.BLACKLIST]: [/黑名单/, /暂时无法预约/],
   [ErrorCategory.SEAT_UNAVAILABLE]: [/座位已被预约/, /座位不可用/, /已被占用/],
   [ErrorCategory.SESSION_EXPIRED]: [/未登录/, /登录已过期/, /login/i],

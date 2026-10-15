@@ -9,6 +9,7 @@ import {
 export type NotificationType =
   | 'grab_success'
   | 'grab_failed'
+  | 'grab_uncertain'
   | 'grab_started'
   | 'seat_taken'
   | 'pre_reminder'

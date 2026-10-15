@@ -46,14 +46,24 @@ export class GrabSeatProcessor extends WorkerHost {
     if (!task) {
       return;
     }
+    this.logger.log(JSON.stringify({
+      event: 'queue_wakeup', taskId, accountId: task.accountId,
+      jobName: job.name, wakeupMs, taskLoadedMs: Date.now(),
+      triggerAtMs: Number(task.triggerAt) * 1000,
+    }));
 
     // 触发前 5 分钟的会话预检：确保抢座瞬间账号登录态有效
     if (job.name === 'session-precheck') {
+      const precheckStartedMs = Date.now();
       // 放号前 5 分钟提醒：无论下面 session 刷新成功与否都要先发
       await this.sendPreReminder(task);
       try {
         await this.authKeeper.refreshSession(task.accountId);
       } catch (e) {
+        this.logger.warn(JSON.stringify({
+          event: 'session_precheck_result', taskId, accountId: task.accountId,
+          success: false, durationMs: Date.now() - precheckStartedMs, ts: Date.now(),
+        }));
         await this.notification.notify({
           userId: task.accountId,
           taskId: task.id,
@@ -69,6 +79,10 @@ export class GrabSeatProcessor extends WorkerHost {
         }
         return; // 会话都刷新不了，预解析必然失败，直接结束预检
       }
+      this.logger.log(JSON.stringify({
+        event: 'session_precheck_result', taskId, accountId: task.accountId,
+        success: true, durationMs: Date.now() - precheckStartedMs, ts: Date.now(),
+      }));
 
       // 严格模式盲抢预解析：锁定房间 + 偏好座位号→seatId + 缓存 userInfoId。
       // 失败不阻断：正式抢座时 worker 会回退 search-first 循环

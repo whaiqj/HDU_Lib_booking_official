@@ -78,6 +78,7 @@ function TaskStatusDisplay({
         if (
           result.status === "success" ||
           result.status === "failed" ||
+          result.status === "uncertain" ||
           result.status === "cancelled"
         ) {
           onSettled?.(); // 任务终态：通知父级解锁提交按钮
@@ -132,7 +133,7 @@ function TaskStatusDisplay({
   // 盲抢候选：严格模式 + 指定了座位偏好（是否真走盲抢还取决于预解析结果）
   const blindCandidate = Boolean(task.strictMode && (task.seatPreference ?? []).length);
   const preparse = task.result?.preparse;
-  // 预解析已明确失败 -> 大概率回退普通模式准点开抢；未执行/成功 -> 晚五秒
+  // 预解析已明确失败 -> 回退普通模式准点开抢；未执行/成功 -> 按盲抢偏移首发
   const blindMode = blindCandidate && preparse?.ok !== false;
 
   let cardClass = "status-card status-card-idle";
@@ -140,6 +141,8 @@ function TaskStatusDisplay({
     cardClass = "status-card status-card-success";
   } else if (task.status === "failed") {
     cardClass = "status-card status-card-failed";
+  } else if (task.status === "uncertain") {
+    cardClass = "status-card status-card-running";
   } else if (task.status === "cancelled") {
     cardClass = "status-card status-card-cancelled";
   } else if (task.status === "running") {
@@ -152,11 +155,12 @@ function TaskStatusDisplay({
         <strong>{status.username}:</strong>{" "}
         {task.status === "pending" &&
           `在 ${formatTriggerLabel(task.triggerAt)} 时${
-            blindMode ? "晚五秒" : ""
+            blindMode ? "约 3 秒后" : ""
           }触发该抢座任务`}
         {task.status === "running" && `抢座中（已尝试 ${task.attempts} 次）`}
         {task.status === "success" && `✓ 预约成功！座位号：${task.result?.seatTitle}`}
         {task.status === "failed" && `✗ 预约失败：${task.result?.reason}`}
+        {task.status === "uncertain" && "⚠ 预约结果待核实：请求曾超时，请查看学校‘我的预约’"}
         {task.status === "cancelled" && "已取消"}
       </div>
       {task.status === "running" &&

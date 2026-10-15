@@ -12,6 +12,7 @@ import {
   buildSeatTakenMessage,
   buildSuccessMessage,
   buildFailedMessage,
+  buildUncertainMessage,
   buildAppointMessageNotification,
   NotificationTemplateData,
 } from './notification-templates';
@@ -133,6 +134,8 @@ export class WxPusherNotificationService implements INotificationService {
         return buildSuccessMessage(d);
       case 'grab_failed':
         return buildFailedMessage(d);
+      case 'grab_uncertain':
+        return buildUncertainMessage(d);
       default:
         return null;
     }

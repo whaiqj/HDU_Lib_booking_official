@@ -8,13 +8,17 @@ import {
   Query,
   NotFoundException,
   BadRequestException,
+  Req,
 } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+import { Logger } from '@nestjs/common';
 import { GrabTaskService } from './grab-task.service';
 import { CreateGrabTaskDto } from './dto/create-grab-task.dto';
 import { GrabTaskResponseDto } from './dto/grab-task-response.dto';
 
 @Controller('grab-tasks')
 export class GrabTaskController {
+  private readonly logger = new Logger(GrabTaskController.name);
   constructor(private readonly grabTaskService: GrabTaskService) {}
 
   /**
@@ -57,8 +61,13 @@ export class GrabTaskController {
    * 取消任务
    */
   @Delete(':id')
-  async cancel(@Param('id') id: string): Promise<void> {
-    await this.grabTaskService.cancel(id);
+  async cancel(@Param('id') id: string, @Req() request: any): Promise<void> {
+    const requestId = randomUUID();
+    this.logger.warn(JSON.stringify({
+      event: 'task_cancel_api_received', taskId: id, requestId,
+      method: request.method, path: '/grab-tasks/:id', ts: Date.now(),
+    }));
+    await this.grabTaskService.cancel(id, requestId);
   }
 
   private toResponse(task: any, warnings?: string[]): GrabTaskResponseDto {

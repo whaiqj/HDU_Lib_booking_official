@@ -2,6 +2,7 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Not, Repository } from 'typeorm';
@@ -12,6 +13,7 @@ import { STUDY_ROOM_SPACE_CATEGORY } from '../../common/constants/study-room';
 
 @Injectable()
 export class GrabTaskService {
+  private readonly logger = new Logger(GrabTaskService.name);
   /** 已请求取消的任务 ID 集合（进程内内存标记，供 worker 重试循环快速轮询） */
   private readonly cancellationRequests = new Set<string>();
 
@@ -49,6 +51,10 @@ export class GrabTaskService {
       where: { accountId: dto.accountId, status: TaskStatus.PENDING },
     });
     for (const oldTask of existingPending) {
+      this.logger.log(JSON.stringify({
+        event: 'task_replaced', oldTaskId: oldTask.id,
+        accountId: dto.accountId, ts: Date.now(),
+      }));
       await this.taskScheduler.cancelTask(oldTask.id);
       await this.updateStatus(oldTask.id, TaskStatus.CANCELLED, { reason: '被新任务覆盖' });
     }
@@ -78,6 +84,11 @@ export class GrabTaskService {
     });
 
     const saved = await this.grabTaskRepository.save(task);
+    this.logger.log(JSON.stringify({
+      event: 'task_created', taskId: saved.id, accountId: saved.accountId,
+      triggerAtMs: Number(saved.triggerAt) * 1000,
+      createdAtMs: Date.now(), strictMode: saved.strictMode,
+    }));
 
     // 计算延迟时间，推入 BullMQ 延迟队列
     await this.taskScheduler.scheduleTask(saved);
@@ -211,7 +222,7 @@ export class GrabTaskService {
    * - running：设置内存取消标记，worker 重试循环感知后立即退出
    * 已进入终态（success/failed/cancelled）的任务不可再取消
    */
-  async cancel(id: string): Promise<void> {
+  async cancel(id: string, requestId?: string): Promise<void> {
     const task = await this.grabTaskRepository.findOne({ where: { id } });
     if (!task) {
       throw new NotFoundException(`Task ${id} not found`);
@@ -222,11 +233,15 @@ export class GrabTaskService {
       await this.updateStatus(id, TaskStatus.CANCELLED, {
         reason: '用户手动取消',
       });
+      this.logger.warn(JSON.stringify({
+        event: 'task_cancel_applied', taskId: id, requestId: requestId ?? null,
+        previousStatus: 'pending', ts: Date.now(),
+      }));
       return;
     }
 
     if (task.status === TaskStatus.RUNNING) {
-      await this.requestCancellation(id);
+      await this.requestCancellation(id, requestId);
       return;
     }
 
@@ -238,11 +253,15 @@ export class GrabTaskService {
    * 1. 写入进程内标记，供 worker 循环轮询快速退出
    * 2. 同步更新数据库状态为 cancelled，前端轮询即可感知
    */
-  private async requestCancellation(id: string): Promise<void> {
+  private async requestCancellation(id: string, requestId?: string): Promise<void> {
     this.cancellationRequests.add(id);
     await this.updateStatus(id, TaskStatus.CANCELLED, {
       reason: '用户手动取消',
     });
+    this.logger.warn(JSON.stringify({
+      event: 'task_cancel_applied', taskId: id, requestId: requestId ?? null,
+      previousStatus: 'running', ts: Date.now(),
+    }));
   }
 
   /**
